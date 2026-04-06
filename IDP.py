@@ -1,6 +1,6 @@
 # ==============================
 # INTELLIGENT DOCUMENT PROCESSOR
-# SPRINT 3 + JD RANKING
+# SPRINT 3 + JD RANKING + Detailed Assessemnt
 # ==============================
 
 import re
@@ -23,6 +23,13 @@ from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
 
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_LEFT, TA_CENTER
+from reportlab.lib import colors
+
 from workflow import build_graph
 from core import (
     build_resume,
@@ -35,6 +42,8 @@ from core import (
     validate_resume_template,
     detect_duplicate_document,
     score_resume_against_jd,
+    generate_consolidated_assessment_data,
+    build_consolidated_assessment_pdf,
 )
 
 # ------------------------------
@@ -159,6 +168,8 @@ DEFAULT_KEYS = {
     "version_history": [],
     "jd_text": "",
     "jd_rankings": [],
+    "detailed_assessment_data": None,
+    "detailed_assessment_pdf": None,
 }
 
 for key, value in DEFAULT_KEYS.items():
@@ -1581,7 +1592,198 @@ def render_jd_ranking():
             st.markdown("**Gaps**")
             for g in item.get("gaps", []):
                 st.caption(f"• {g}")
-                
+
+def render_detailed_assessment_report():
+    st.markdown("### Detailed Assessment Report")
+
+    if st.button("Generate Detailed Assessment", use_container_width=True):
+        jd_text = (st.session_state.get("jd_text") or "").strip()
+        batch_results = st.session_state.get("batch_results", [])
+        jd_rankings = st.session_state.get("jd_rankings", [])
+
+        resume_count = len([
+            x for x in batch_results
+            if x.get("doc_type") == "resume" and x.get("review_data")
+        ])
+
+        if resume_count == 0:
+            st.warning("No processed resumes available in the batch.")
+            return
+
+        if not jd_text:
+            st.warning("Please provide a JD first using paste or upload.")
+            return
+
+        if not jd_rankings:
+            st.warning("Please run JD ranking first.")
+            return
+
+        report_data = generate_consolidated_assessment_data(
+            batch_results=batch_results,
+            jd_text=jd_text,
+            jd_rankings=jd_rankings
+        )
+        pdf_bytes = build_consolidated_assessment_pdf(report_data)
+
+        st.session_state["detailed_assessment_data"] = report_data
+        st.session_state["detailed_assessment_pdf"] = pdf_bytes
+        st.success("Detailed assessment generated successfully.")
+
+    report_data = st.session_state.get("detailed_assessment_data")
+    pdf_bytes = st.session_state.get("detailed_assessment_pdf")
+
+    if not report_data:
+        st.caption("No detailed assessment generated yet.")
+        return
+
+    executive = report_data.get("executive_summary", {})
+    candidates = report_data.get("candidates", [])
+    final_summary = report_data.get("final_summary", {})
+    recruiter_questions = report_data.get("recruiter_questions", [])
+
+    k1, k2, k3 = st.columns(3)
+    with k1:
+        st.metric("Candidates", executive.get("total_candidates", 0))
+    with k2:
+        st.metric("Top Match Range", executive.get("top_match_range", "-"))
+    with k3:
+        st.metric("Recommended Action", executive.get("recommended_action", "-"))
+
+    with st.expander("Executive Summary", expanded=True):
+        st.markdown("**JD Summary**")
+        st.write(executive.get("jd_summary", "-"))
+        st.markdown("**Executive Takeaway**")
+        st.write(executive.get("executive_takeaway", "-"))
+
+    st.markdown("#### Candidate Score Cards")
+    if candidates:
+        score_cols = st.columns(min(4, len(candidates)))
+        for idx, candidate in enumerate(candidates[:4]):
+            with score_cols[idx]:
+                score = int(candidate.get("overall_score", 0))
+                if score >= 85:
+                    box_color = "#e7f8ee"
+                    text_color = "#0f9d58"
+                elif score >= 70:
+                    box_color = "#fff4e5"
+                    text_color = "#b26a00"
+                else:
+                    box_color = "#fdecec"
+                    text_color = "#b42318"
+
+                st.markdown(
+                    f"""
+                    <div style="
+                        border-radius:16px;
+                        padding:16px;
+                        background:{box_color};
+                        border:1px solid #e5e7eb;
+                        min-height:130px;
+                    ">
+                        <div style="font-size:14px;font-weight:700;color:#111827;">
+                            {candidate.get('candidate_name', '-')}
+                        </div>
+                        <div style="font-size:28px;font-weight:800;color:{text_color};margin-top:6px;">
+                            {score}
+                        </div>
+                        <div style="font-size:12px;color:#4b5563;">
+                            {candidate.get('shortlist_label', '-')} • {candidate.get('recommendation', '-')}
+                        </div>
+                        <div style="font-size:12px;color:#6b7280;margin-top:8px;">
+                            {candidate.get('current_role', '-') or '-'}
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+    st.markdown("#### Candidate Ranking & Shortlist Decision")
+    rows = []
+    for idx, candidate in enumerate(candidates, start=1):
+        rows.append({
+            "Rank": idx,
+            "Candidate": candidate.get("candidate_name"),
+            "File": candidate.get("file_name"),
+            "Overall Score": candidate.get("overall_score"),
+            "Recommendation": candidate.get("shortlist_label"),
+            "Fitment Progress": candidate.get("fitment_progress"),
+        })
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Shortlist Recommendation")
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        st.success("Primary")
+        for item in final_summary.get("primary_candidates", []):
+            st.caption(f"• {item}")
+    with s2:
+        st.info("Backup")
+        for item in final_summary.get("backup_candidates", []):
+            st.caption(f"• {item}")
+    with s3:
+        st.warning("Hold")
+        for item in final_summary.get("hold_candidates", []):
+            st.caption(f"• {item}")
+
+    if candidates:
+        candidate_index = st.selectbox(
+            "Open candidate detailed view",
+            options=list(range(len(candidates))),
+            format_func=lambda i: f"{i+1}. {candidates[i].get('candidate_name', '-')}",
+            key="detailed_assessment_candidate_selector"
+        )
+
+        candidate = candidates[candidate_index]
+        with st.expander("Candidate Detailed View", expanded=True):
+            d1, d2, d3, d4 = st.columns(4)
+            with d1:
+                st.metric("Overall", candidate.get("overall_score", 0))
+            with d2:
+                st.metric("Skills", candidate.get("skills_score", 0))
+            with d3:
+                st.metric("Experience", candidate.get("experience_score", 0))
+            with d4:
+                st.metric("Education", candidate.get("education_score", 0))
+
+            st.markdown(f"**Candidate:** {candidate.get('candidate_name', '-')}")
+            st.markdown(f"**Current Role:** {candidate.get('current_role', '-') or '-'}")
+            st.markdown(f"**Location:** {candidate.get('location', '-') or '-'}")
+            st.markdown(f"**Recommendation:** {candidate.get('recommendation', '-')}")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Matched Skills**")
+                st.write(", ".join(candidate.get("matched_skills", [])) or "-")
+                st.markdown("**Strengths**")
+                for s in candidate.get("strengths", []):
+                    st.caption(f"• {s}")
+            with c2:
+                st.markdown("**Missing Skills**")
+                st.write(", ".join(candidate.get("missing_skills", [])) or "-")
+                st.markdown("**Gaps / Risks**")
+                for g in candidate.get("gaps", []):
+                    st.caption(f"• {g}")
+
+    with st.expander("Recruiter Screening Questions", expanded=False):
+        if recruiter_questions:
+            q_rows = []
+            for item in recruiter_questions:
+                q_rows.append({
+                    "Question": item.get("question", "-"),
+                    "Expected Answer": item.get("expected_answer", "-")
+                })
+            st.dataframe(pd.DataFrame(q_rows), use_container_width=True, hide_index=True)
+
+    if pdf_bytes:
+        st.download_button(
+            "Download DetailedAssesment.pdf",
+            data=pdf_bytes,
+            file_name="DetailedAssesment.pdf",
+            mime="application/pdf",
+            use_container_width=True
+        )
+
 # ------------------------------
 # MAIN
 # ------------------------------
@@ -1723,6 +1925,9 @@ render_batch_downloads()
 
 st.markdown("---")
 render_jd_ranking()
+
+st.markdown("---")
+render_detailed_assessment_report()
 
 st.markdown("---")
 col_a, col_b = st.columns(2)
