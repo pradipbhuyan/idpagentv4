@@ -1108,9 +1108,11 @@ def render_header():
 
 def render_sidebar_and_upload():
     with st.sidebar:
-        st.write(f"**{st.session_state['user']}**")
+        st.write(f"Hi **{st.session_state['user']}**")
 
-        st.markdown("### Model")
+        #st.markdown("### Model")
+        st.markdown("---")
+        
         model_choice = st.selectbox(
             "Choose Model",
             ["gpt-4o-mini", "gpt-4o", "gpt-5"],
@@ -1120,6 +1122,7 @@ def render_sidebar_and_upload():
         )
         st.session_state["model_choice"] = model_choice
 
+        st.markdown("---")
         st.success("🔑 API key loaded securely")
         cost = st.session_state.get("metrics", {}).get("cost", 0.0)
         st.write(f"💰 Session Cost ${round(cost, 6)}")
