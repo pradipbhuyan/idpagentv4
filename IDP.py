@@ -21,7 +21,7 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.document_loaders import TextLoader
+from langchain_community.document_loaders import TextLoader, PyPDFLoader
 
 from workflow import build_graph
 from core import (
@@ -172,6 +172,31 @@ if not st.session_state["logged_in"]:
 # ------------------------------
 # HELPERS
 # ------------------------------
+
+def extract_jd_text_from_upload(uploaded_file):
+    if not uploaded_file:
+        return ""
+
+    suffix = Path(uploaded_file.name).suffix.lower()
+    file_path = save_temp_file(uploaded_file)
+
+    try:
+        if suffix == ".pdf":
+            docs = PyPDFLoader(file_path).load()
+            return "\n".join(
+                [d.page_content for d in docs if getattr(d, "page_content", None)]
+            ).strip()
+
+        if suffix == ".docx":
+            return extract_docx_text(file_path).strip()
+
+    except Exception as e:
+        st.error(f"JD file read failed: {str(e)}")
+        return ""
+
+    st.warning("Unsupported JD file type. Please upload PDF or DOCX.")
+    return ""
+
 def reset_run_state():
     st.session_state["review_data"] = None
     st.session_state["confidence_map"] = None
@@ -1450,12 +1475,45 @@ def render_batch_downloads():
 def render_jd_ranking():
     st.markdown("### JD Match Ranking")
 
-    st.session_state.jd_text = st.text_area(
-        "Paste Job Description",
-        value=st.session_state.get("jd_text", ""),
-        height=220,
-        key="jd_text_area"
-    )
+    c1, c2 = st.columns([2, 1], gap="medium")
+
+    with c1:
+        pasted_jd = st.text_area(
+            "Paste Job Description",
+            value=st.session_state.get("jd_text", ""),
+            height=220,
+            key="jd_text_area"
+        )
+
+    with c2:
+        jd_file = st.file_uploader(
+            "Upload JD File",
+            type=["pdf", "docx"],
+            key="jd_file_uploader"
+        )
+
+        use_uploaded_jd = st.checkbox(
+            "Use uploaded JD file",
+            value=bool(jd_file),
+            key="use_uploaded_jd_checkbox"
+        )
+
+    jd_text = pasted_jd.strip()
+
+    if jd_file and use_uploaded_jd:
+        uploaded_jd_text = extract_jd_text_from_upload(jd_file)
+        if uploaded_jd_text:
+            jd_text = uploaded_jd_text
+            with st.expander("Preview extracted JD text", expanded=False):
+                st.text_area(
+                    "Extracted JD",
+                    value=uploaded_jd_text[:5000],
+                    height=200,
+                    disabled=True,
+                    label_visibility="collapsed"
+                )
+
+    st.session_state.jd_text = jd_text
 
     if st.button("Rank All CVs Against JD", use_container_width=True):
         rank_all_resumes_against_jd()
@@ -1503,7 +1561,7 @@ def render_jd_ranking():
             st.markdown("**Gaps**")
             for g in item.get("gaps", []):
                 st.caption(f"• {g}")
-
+                
 # ------------------------------
 # MAIN
 # ------------------------------
