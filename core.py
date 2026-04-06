@@ -15,6 +15,13 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from streamlit import session_state as st_state
 
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_LEFT, TA_CENTER
+from reportlab.lib import colors
+
 MODEL_PRICING = {
     "gpt-4o-mini": {"input_per_1k": 0.00015, "output_per_1k": 0.0006},
     "gpt-4o": {"input_per_1k": 0.005, "output_per_1k": 0.015},
