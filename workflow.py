@@ -1,5 +1,4 @@
-from typing import TypedDict, Any, Optional
-from pathlib import Path
+from typing import TypedDict
 import time
 
 from langgraph.graph import StateGraph, END
@@ -12,223 +11,203 @@ from core import (
     generate_excel,
     get_current_metrics_snapshot,
     diff_metrics_snapshot,
-    validate_document_data,
-    build_confidence_map,
+    send_to_concur,
 )
+
 
 class IDPState(TypedDict, total=False):
     text: str
-    template: Optional[bytes]
     filename: str
-    progress: Any
+    template: bytes
+    progress: any
+    event_callback: any
+    ocr_used: bool
+    extraction_mode: str
+    exception_reason: str
 
     doc_type: str
     data: dict
     result: dict
     error: str
     step_metrics: list
-    confidence: dict
     validation: dict
-    ocr_used: bool
-    extraction_mode: str
-    exception_reason: str
-    needs_review: bool
+    confidence: dict
 
 
-def safe_progress(state, percent, message):
+def safe_progress(state: IDPState, percent: int, message: str):
     progress = state.get("progress")
     if progress:
-        progress(percent, message)
+        try:
+            progress(percent, message)
+        except Exception:
+            pass
 
 
-def add_step_metric(state, step, started_at, before_metrics, message=""):
-    after_metrics = get_current_metrics_snapshot()
-    delta = diff_metrics_snapshot(before_metrics, after_metrics)
+def emit_agent_event(state: IDPState, agent: str, status: str, message: str):
+    callback = state.get("event_callback")
+    if callback:
+        try:
+            callback(agent, status, message)
+        except Exception:
+            pass
+
+
+def add_step_metric(state: IDPState, step_name: str, started_at: float, before: dict, note: str = ""):
+    after = get_current_metrics_snapshot()
+    diff = diff_metrics_snapshot(before, after)
+
     if "step_metrics" not in state or state["step_metrics"] is None:
         state["step_metrics"] = []
+
     state["step_metrics"].append({
-        "step": step,
-        "message": message,
-        "duration": time.time() - started_at,
-        "metrics": delta
+        "step": step_name,
+        "duration_sec": round(time.time() - started_at, 2),
+        "tokens": diff.get("tokens", 0),
+        "input_tokens": diff.get("input_tokens", 0),
+        "output_tokens": diff.get("output_tokens", 0),
+        "cost": round(diff.get("cost", 0.0), 6),
+        "calls": diff.get("calls", 0),
+        "note": note,
     })
-
-
-def get_resume_filename_from_data(data: dict) -> str:
-    if not isinstance(data, dict):
-        return "candidate.docx"
-
-    name = (
-        data.get("name")
-        or data.get("Name")
-        or data.get("candidate_name")
-        or (
-            data.get("personal_details", {}).get("name")
-            if isinstance(data.get("personal_details"), dict)
-            else None
-        )
-        or "candidate"
-    )
-
-    import re
-    safe_name = re.sub(r'[\\/*?:"<>|]', "", str(name)).strip()
-    safe_name = safe_name if safe_name else "candidate"
-    return f"{safe_name}.docx"
 
 
 def detect_node(state: IDPState) -> IDPState:
     started_at = time.time()
     before = get_current_metrics_snapshot()
-    safe_progress(state, 35, "Detecting document type")
 
-    text = (state.get("text") or "").strip()
-    if not text:
-        state["error"] = "No extracted text available for processing"
-        state["doc_type"] = "other"
-        add_step_metric(state, "Detect document type", started_at, before, "No text found")
-        return state
+    emit_agent_event(state, "Classification Agent", "running", "Classifying document")
+    safe_progress(state, 40, "Classification Agent — classifying document")
 
-    try:
-        state["doc_type"] = detect_document_type(text)
-        add_step_metric(state, "Detect document type", started_at, before, f"Detected {state['doc_type']}")
-    except Exception as e:
-        state["error"] = f"Document type detection failed: {str(e)}"
-        state["doc_type"] = "other"
-        add_step_metric(state, "Detect document type", started_at, before, str(e))
+    state["doc_type"] = detect_document_type(state.get("text", ""))
 
+    emit_agent_event(
+        state,
+        "Classification Agent",
+        "done",
+        f"Document identified as {state.get('doc_type', 'other')}"
+    )
+
+    add_step_metric(state, "Detect document type", started_at, before, state.get("doc_type", "unknown"))
     return state
 
 
-def resume_extract_node(state: IDPState) -> IDPState:
+def extract_node(state: IDPState) -> IDPState:
     started_at = time.time()
     before = get_current_metrics_snapshot()
-    safe_progress(state, 50, "Extracting resume details")
 
-    try:
-        state["data"] = extract_structured_json(state["text"], "resume")
-        add_step_metric(state, "Extract resume data", started_at, before, "Resume fields extracted")
-    except Exception as e:
-        state["error"] = f"Resume extraction failed: {str(e)}"
+    doc_type = state.get("doc_type", "other")
+
+    if doc_type == "resume":
+        emit_agent_event(state, "Structuring Agent", "running", "Extracting candidate profile")
+        safe_progress(state, 55, "Structuring Agent — extracting candidate profile")
+    elif doc_type == "invoice":
+        emit_agent_event(state, "Structuring Agent", "running", "Extracting invoice fields")
+        safe_progress(state, 55, "Structuring Agent — extracting invoice fields")
+    elif doc_type == "ticket":
+        emit_agent_event(state, "Structuring Agent", "running", "Extracting travel fields")
+        safe_progress(state, 55, "Structuring Agent — extracting travel fields")
+
+    if doc_type in ["invoice", "ticket", "resume"]:
+        state["data"] = extract_structured_json(state.get("text", ""), doc_type)
+
+        if doc_type == "resume":
+            emit_agent_event(state, "Structuring Agent", "done", "Candidate profile extracted")
+        elif doc_type == "invoice":
+            emit_agent_event(state, "Structuring Agent", "done", "Invoice fields extracted")
+        elif doc_type == "ticket":
+            emit_agent_event(state, "Structuring Agent", "done", "Travel fields extracted")
+
+        add_step_metric(state, "Extract structured data", started_at, before, doc_type)
+    else:
         state["data"] = {}
-        add_step_metric(state, "Extract resume data", started_at, before, str(e))
+        add_step_metric(state, "Skip structured extraction", started_at, before, doc_type)
 
-    state["validation"] = validate_document_data(state.get("data") or {}, "resume")
-    state["confidence"] = build_confidence_map(state.get("data") or {}, "resume")
-    state["needs_review"] = not state["validation"].get("passed", True)
     return state
 
 
 def resume_node(state: IDPState) -> IDPState:
     started_at = time.time()
     before = get_current_metrics_snapshot()
-    safe_progress(state, 75, "Building resume")
+
+    emit_agent_event(state, "Output Agent", "running", "Generating resume in template")
+    safe_progress(state, 75, "Output Agent — generating resume in template")
 
     data = state.get("data") or {}
     template_bytes = state.get("template")
 
-    if not template_bytes:
-        possible_paths = [
-            Path("templates/resume_template.docx"),
-            Path("templates:resume_template.docx"),
-            Path(__file__).parent / "templates" / "resume_template.docx",
-            Path(__file__).parent / "templates:resume_template.docx",
-        ]
-        for template_path in possible_paths:
-            if template_path.exists():
-                with open(template_path, "rb") as f:
-                    template_bytes = f.read()
-                break
+    file_bytes = build_resume(data, template_bytes)
 
-    if not template_bytes:
-        state["error"] = "No resume template provided and default template not found"
-        state["result"] = {
-            "type": "resume",
-            "file": None,
-            "data": data,
-            "file_name": "candidate.docx",
-            "message": "Resume template missing"
-        }
-        add_step_metric(state, "Build resume", started_at, before, "Template missing")
-        return state
+    emit_agent_event(state, "Output Agent", "done", "Resume generated")
+    safe_progress(state, 95, "Output Agent — resume ready")
 
-    try:
-        file_bytes = build_resume(data, template_bytes)
-        file_name = get_resume_filename_from_data(data)
+    candidate_name = (data.get("name") or "candidate").strip() if isinstance(data, dict) else "candidate"
+    safe_name = "".join(ch for ch in candidate_name if ch not in '\\/*?:"<>|').strip() or "candidate"
 
-        safe_progress(state, 95, "Resume ready")
-        state["result"] = {
-            "type": "resume",
-            "file": file_bytes,
-            "data": data,
-            "file_name": file_name,
-            "message": "Resume generated successfully"
-        }
-        add_step_metric(state, "Build resume", started_at, before, "Resume file created")
-    except Exception as e:
-        state["error"] = f"Resume generation failed: {str(e)}"
-        state["result"] = {
-            "type": "resume",
-            "file": None,
-            "data": data,
-            "file_name": "candidate.docx",
-            "message": str(e)
-        }
-        add_step_metric(state, "Build resume", started_at, before, str(e))
+    state["result"] = {
+        "type": "resume",
+        "file": file_bytes,
+        "file_name": f"{safe_name}.docx",
+        "data": data,
+    }
 
-    return state
-
-
-def extract_json_node(state: IDPState) -> IDPState:
-    started_at = time.time()
-    before = get_current_metrics_snapshot()
-    safe_progress(state, 50, "Extracting structured fields")
-
-    doc_type = state.get("doc_type", "other")
-    try:
-        state["data"] = extract_structured_json(state["text"], doc_type)
-        add_step_metric(state, f"Extract {doc_type} data", started_at, before, "Structured fields extracted")
-    except Exception as e:
-        state["error"] = f"Structured extraction failed: {str(e)}"
-        state["data"] = {}
-        add_step_metric(state, f"Extract {doc_type} data", started_at, before, str(e))
-
-    state["validation"] = validate_document_data(state.get("data") or {}, doc_type)
-    state["confidence"] = build_confidence_map(state.get("data") or {}, doc_type)
-    state["needs_review"] = not state["validation"].get("passed", True)
+    add_step_metric(state, "Build resume", started_at, before, state["result"]["file_name"])
     return state
 
 
 def invoice_node(state: IDPState) -> IDPState:
     started_at = time.time()
     before = get_current_metrics_snapshot()
-    safe_progress(state, 75, "Preparing invoice output")
 
     data = state.get("data") or {}
+
     try:
+        emit_agent_event(state, "Output Agent", "running", "Creating invoice Excel")
+        safe_progress(state, 70, "Output Agent — creating invoice Excel")
+
         df = json_to_kv_dataframe(data)
         excel = generate_excel(df)
 
-        safe_progress(state, 95, "Invoice ready for review")
+        emit_agent_event(state, "Output Agent", "done", "Invoice Excel created")
+
+        emit_agent_event(state, "Concur Agent", "running", "Submitting invoice to Concur")
+        safe_progress(state, 88, "Concur Agent — submitting invoice to Concur")
+
+        concur_result = send_to_concur("invoice", data, mode="mock")
+
+        emit_agent_event(state, "Concur Agent", "done", "Invoice submitted to Concur")
+        safe_progress(state, 95, "Concur Agent — invoice submitted")
+
         state["result"] = {
             "type": "invoice",
             "table": df,
             "excel": excel,
             "data": data,
-            "concur_status": None,
-            "concur_mode": None,
-            "message": "Invoice extracted. Review and approve to send to Concur."
+            "payload": concur_result.get("payload"),
+            "concur_status": concur_result.get("status"),
+            "concur_mode": concur_result.get("mode"),
+            "concur_submission_id": concur_result.get("submission_id"),
+            "concur_batch_id": concur_result.get("batch_id"),
+            "concur_document_id": concur_result.get("document_id"),
+            "concur_submitted_at": concur_result.get("submitted_at"),
+            "concur_endpoint": concur_result.get("endpoint"),
+            "concur_processing_state": concur_result.get("processing_state"),
+            "concur_next_status": concur_result.get("next_status"),
+            "message": concur_result.get("message", "Invoice processed successfully")
         }
-        add_step_metric(state, "Create invoice output", started_at, before, "Invoice ready")
+
+        add_step_metric(state, "Create invoice output + send to Concur", started_at, before, "Invoice submitted")
     except Exception as e:
-        state["error"] = f"Invoice output generation failed: {str(e)}"
+        emit_agent_event(state, "Concur Agent", "error", str(e))
+        state["error"] = f"Invoice processing failed: {str(e)}"
         state["result"] = {
             "type": "invoice",
             "table": None,
             "excel": None,
             "data": data,
+            "concur_status": "error",
             "message": str(e)
         }
-        add_step_metric(state, "Create invoice output", started_at, before, str(e))
+        add_step_metric(state, "Create invoice output + send to Concur", started_at, before, str(e))
 
     return state
 
@@ -236,96 +215,94 @@ def invoice_node(state: IDPState) -> IDPState:
 def ticket_node(state: IDPState) -> IDPState:
     started_at = time.time()
     before = get_current_metrics_snapshot()
-    safe_progress(state, 75, "Preparing ticket output")
 
     data = state.get("data") or {}
+
     try:
-        safe_progress(state, 95, "Ticket ready for review")
+        emit_agent_event(state, "Output Agent", "running", "Preparing ticket payload")
+        safe_progress(state, 70, "Output Agent — preparing ticket payload")
+
+        emit_agent_event(state, "Output Agent", "done", "Ticket payload ready")
+
+        emit_agent_event(state, "Concur Agent", "running", "Submitting ticket to Concur")
+        safe_progress(state, 88, "Concur Agent — submitting ticket to Concur")
+
+        concur_result = send_to_concur("ticket", data, mode="mock")
+
+        emit_agent_event(state, "Concur Agent", "done", "Ticket submitted to Concur")
+        safe_progress(state, 95, "Concur Agent — ticket submitted")
+
         state["result"] = {
             "type": "ticket",
-            "status": "ready",
+            "status": "sent",
             "data": data,
-            "concur_status": None,
-            "concur_mode": None,
-            "message": "Ticket extracted. Review and approve to send to Concur."
+            "payload": concur_result.get("payload"),
+            "concur_status": concur_result.get("status"),
+            "concur_mode": concur_result.get("mode"),
+            "concur_submission_id": concur_result.get("submission_id"),
+            "concur_batch_id": concur_result.get("batch_id"),
+            "concur_document_id": concur_result.get("document_id"),
+            "concur_submitted_at": concur_result.get("submitted_at"),
+            "concur_endpoint": concur_result.get("endpoint"),
+            "concur_processing_state": concur_result.get("processing_state"),
+            "concur_next_status": concur_result.get("next_status"),
+            "message": concur_result.get("message", "Ticket processed successfully")
         }
-        add_step_metric(state, "Create ticket output", started_at, before, "Ticket ready")
+
+        add_step_metric(state, "Create ticket output + send to Concur", started_at, before, "Ticket submitted")
     except Exception as e:
+        emit_agent_event(state, "Concur Agent", "error", str(e))
         state["error"] = f"Ticket processing failed: {str(e)}"
         state["result"] = {
             "type": "ticket",
             "status": "error",
             "data": data,
+            "concur_status": "error",
             "message": str(e)
         }
-        add_step_metric(state, "Create ticket output", started_at, before, str(e))
+        add_step_metric(state, "Create ticket output + send to Concur", started_at, before, str(e))
 
     return state
 
 
 def other_node(state: IDPState) -> IDPState:
-    started_at = time.time()
-    before = get_current_metrics_snapshot()
-    safe_progress(state, 85, "Finalizing output")
-
-    state["data"] = {}
     state["result"] = {
-        "type": state.get("doc_type", "other"),
-        "message": f"No structured output configured for document type: {state.get('doc_type', 'other')}"
+        "type": "other",
+        "data": {},
     }
-    add_step_metric(state, "Finalize generic output", started_at, before, "No structured processing needed")
     return state
 
 
-def route_after_detect(state: IDPState) -> str:
+def route(state: IDPState):
     dt = state.get("doc_type", "other")
+
     if dt == "resume":
-        return "resume_extract"
-    elif dt in ["invoice", "ticket"]:
-        return "extract_json"
-    else:
-        return "other"
-
-
-def route_after_extract_json(state: IDPState) -> str:
-    dt = state.get("doc_type", "other")
+        return "resume"
     if dt == "invoice":
         return "invoice"
-    elif dt == "ticket":
+    if dt == "ticket":
         return "ticket"
-    else:
-        return "other"
+    return "other"
 
 
 def build_graph():
     builder = StateGraph(IDPState)
 
     builder.add_node("detect", detect_node)
-    builder.add_node("resume_extract", resume_extract_node)
+    builder.add_node("extract", extract_node)
     builder.add_node("resume", resume_node)
-    builder.add_node("extract_json", extract_json_node)
     builder.add_node("invoice", invoice_node)
     builder.add_node("ticket", ticket_node)
     builder.add_node("other", other_node)
 
     builder.set_entry_point("detect")
+    builder.add_edge("detect", "extract")
 
     builder.add_conditional_edges(
-        "detect",
-        route_after_detect,
+        "extract",
+        route,
         {
-            "resume_extract": "resume_extract",
-            "extract_json": "extract_json",
-            "other": "other",
-        }
-    )
-
-    builder.add_edge("resume_extract", "resume")
-
-    builder.add_conditional_edges(
-        "extract_json",
-        route_after_extract_json,
-        {
+            "resume": "resume",
             "invoice": "invoice",
             "ticket": "ticket",
             "other": "other",
