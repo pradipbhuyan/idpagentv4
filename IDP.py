@@ -1125,6 +1125,8 @@ def render_sidebar_and_upload():
         st.markdown("---")
         st.success("🔑 API key loaded securely")
         cost = st.session_state.get("metrics", {}).get("cost", 0.0)
+
+        st.markdown("---")
         st.write(f"💰 Session Cost ${round(cost, 6)}")
 
         st.markdown("---")
