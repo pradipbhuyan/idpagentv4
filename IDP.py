@@ -625,19 +625,19 @@ def process_single_file(uploaded_file):
     reset_single_file_state()
     st.session_state.current_file = uploaded_file.name
 
-    record_agent_event("Upload received", "done", uploaded_file.name)
-    update_progress(5, "Upload received")
+    record_agent_event("Ingestion Agent", "done", "File received")
+    update_progress(5, "Ingestion Agent — file received")
 
     extracted = process_file_with_fallback(uploaded_file)
     docs = extracted["documents"]
     full_text = extracted["text"]
 
     if extracted["ocr_used"]:
-        record_agent_event("OCR fallback", "done", extracted["extraction_mode"])
+        record_agent_event("Extraction Agent", "done", "Text extracted using OCR fallback")
     else:
-        record_agent_event("Text extraction", "done", extracted["extraction_mode"])
+        record_agent_event("Extraction Agent", "done", "Text extracted")
 
-    update_progress(20, "Text extracted")
+    update_progress(20, "Extraction Agent — text extracted")
 
     if not full_text:
         reason = extracted["exception_reason"] or "No extractable text"
@@ -661,8 +661,8 @@ def process_single_file(uploaded_file):
 
     vectorstore = create_vectorstore(docs)
     st.session_state.vectorstore = vectorstore
-    record_agent_event("Search index", "done", "Vector index created")
-    update_progress(30, "Search index ready")
+    record_agent_event("Retrieval Agent", "done", "Vector index created")
+    update_progress(30, "Retrieval Agent — search index ready")
 
     graph = build_graph()
     graph_input = {
@@ -670,6 +670,7 @@ def process_single_file(uploaded_file):
         "filename": uploaded_file.name,
         "template": get_active_template_bytes(),
         "progress": update_progress,
+        "event_callback": record_agent_event,
         "ocr_used": extracted["ocr_used"],
         "extraction_mode": extracted["extraction_mode"],
         "exception_reason": extracted["exception_reason"],
@@ -684,8 +685,22 @@ def process_single_file(uploaded_file):
     doc_type = normalized.get("doc_type")
     result = normalized.get("result", {})
     review_data = result.get("data") or normalized.get("structured_data") or {}
+
+    record_agent_event("Validation Agent", "running", "Checking required fields")
     validation = normalized.get("validation") or validate_document_data(review_data, doc_type)
     confidence = normalized.get("confidence") or build_confidence_map(review_data, doc_type)
+
+    if validation.get("passed", True):
+        if doc_type == "resume":
+            record_agent_event("Validation Agent", "done", "Resume validation complete")
+        elif doc_type == "invoice":
+            record_agent_event("Validation Agent", "done", "Invoice validation complete")
+        elif doc_type == "ticket":
+            record_agent_event("Validation Agent", "done", "Ticket validation complete")
+        else:
+            record_agent_event("Validation Agent", "done", "Validation complete")
+    else:
+        record_agent_event("Validation Agent", "error", "Validation issues found")
 
     duplicate_info = detect_duplicate_document(
         new_doc_type=doc_type,
@@ -727,8 +742,8 @@ def process_single_file(uploaded_file):
     elif not validation.get("passed", True):
         status = "Review Needed"
 
-    record_agent_event("Output ready", "done", f"Detected type: {doc_type}")
-    update_progress(100, "Completed")
+    record_agent_event("Workflow Agent", "done", f"Processing completed for {doc_type}")
+    update_progress(100, "Workflow Agent — completed")
 
     save_version_snapshot(
         file_name=uploaded_file.name,
