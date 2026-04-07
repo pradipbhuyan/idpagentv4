@@ -1705,11 +1705,7 @@ st.markdown("---")
 render_jd_ranking()
 
 st.markdown("---")
-col_a, col_b = st.columns(2)
-with col_a:
-    render_template_manager()
-with col_b:
-    render_version_history()
+render_template_manager()
 
 with st.expander("Metrics", expanded=False):
     m = st.session_state.get("metrics", {})
